@@ -24,6 +24,7 @@ from utils.general import (LOGGER, check_requirements, check_suffix, colorstr, i
                            non_max_suppression, scale_coords, xywh2xyxy, xyxy2xywh)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import time_sync
+WIDTH_LIST = [0.5, 1]
 
 
 def autopad(k, p=None):  # kernel, padding
@@ -32,13 +33,81 @@ def autopad(k, p=None):  # kernel, padding
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
 
+def make_divisible_sl(v, divisor=2, min_value=2):
+    """
+    forked from slim:
+    https://github.com/tensorflow/models/blob/\
+    0344c5503ee55e24f0de7f37336a6e08f10976fd/\
+    research/slim/nets/mobilenet/mobilenet.py#L62-L69
+    """
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    # Make sure that round down does not go down by more than 10%.
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+class USConv2d(nn.Conv2d):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, dilation=1, groups=1, depthwise=False, bias=True,
+                 us='normal', width_mult=1,):
+        super(USConv2d, self).__init__(
+            in_channels, out_channels,
+            kernel_size, stride=stride, padding=padding, dilation=dilation,
+            groups=groups, bias=bias)
+        self.depthwise = depthwise
+        self.in_channels_max = in_channels
+        self.out_channels_max = out_channels
+        # self.width_mult = None
+        self.width_mult = width_mult
+        self.us = us
+
+    def forward(self, input):
+        if self.us != 'begin':
+            self.in_channels = make_divisible_sl(
+                self.in_channels_max
+                * self.width_mult)
+        if self.us != 'end':
+            self.out_channels = make_divisible_sl(
+                self.out_channels_max
+                * self.width_mult)
+        self.groups = self.in_channels if self.depthwise else 1
+        weight = self.weight[:self.out_channels, :self.in_channels, :, :]
+        if self.bias is not None:
+            bias = self.bias[:self.out_channels]
+        else:
+            bias = self.bias
+        y = nn.functional.conv2d(
+            input, weight, bias, self.stride, self.padding,
+            self.dilation, self.groups)
+        return y
+
+class SwitchableBatchNorm2d(nn.Module):
+    def __init__(self, c, rate=1 ):
+        super(SwitchableBatchNorm2d, self).__init__()
+        num_features_list = [make_divisible_sl(c*i/rate)*rate for i in WIDTH_LIST]
+        self.num_features=num_features_list
+        self.num_features_list = num_features_list
+        self.num_features = max(num_features_list)
+        bns = []
+        for i in num_features_list:
+            bns.append(nn.BatchNorm2d(i))
+        self.bn = nn.ModuleList(bns)
+        self.width_mult = max(WIDTH_LIST)
+        self.ignore_model_profiling = True
+
+    def forward(self, input):
+        idx = WIDTH_LIST.index(self.width_mult)
+        y = self.bn[idx](input)
+        return y
+
 
 class Conv(nn.Module):
     # Standard convolution
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, us='normal'):  # ch_in, ch_out, kernel, stride, padding, groups
         super().__init__()
-        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
-        self.bn = nn.BatchNorm2d(c2)
+        self.conv = USConv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False, us=us)
+        self.bn = SwitchableBatchNorm2d(c2)
         self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
@@ -47,6 +116,19 @@ class Conv(nn.Module):
     def forward_fuse(self, x):
         return self.act(self.conv(x))
 
+class Conv_in(nn.Module):
+    # Standard convolution
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, us='start'):  # ch_in, ch_out, kernel, stride, padding, groups
+        super().__init__()
+        self.conv = USConv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False, us=us)
+        self.bn = SwitchableBatchNorm2d(c2)
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+    def forward_fuse(self, x):
+        return self.act(self.conv(x))
 
 class DWConv(Conv):
     # Depth-wise convolution class
@@ -124,12 +206,12 @@ class BottleneckCSP(nn.Module):
 
 class C3(nn.Module):
     # CSP Bottleneck with 3 convolutions
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+    def __init__(self, c1, c2, n=1, shortcut=True, us='normal', g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
+        self.cv3 = Conv(2 * c_, c2, 1,us=us)  # act=FReLU(c2)
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
         # self.m = nn.Sequential(*[CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)])
 

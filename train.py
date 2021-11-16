@@ -50,6 +50,7 @@ from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
 
+from models.common import WIDTH_LIST
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
@@ -313,17 +314,43 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
-            # Forward
-            with amp.autocast(enabled=cuda):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                if opt.quad:
-                    loss *= 4.
+            
+
+            assert len(WIDTH_LIST)>=2,'width list must be more than 1'
+            for i in sorted(WIDTH_LIST, reverse=True)[0::]:
+                model.apply(lambda m: setattr(m, 'width_mult', i))
+                if i == 1:
+                    # Forward
+                    with amp.autocast(enabled=cuda):
+                        pred = model(imgs)  # forward
+                        loss, loss_items, soft_box, soft_cls, soft_obj = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                        if RANK != -1:
+                            loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                        if opt.quad:
+                            loss *= 4.
+                    # Backward
+                    scaler.scale(loss).backward()
+                else:
+                    with amp.autocast(enabled=cuda):
+                        pred = model(imgs)  # forward
+                        loss, loss_items = compute_loss(pred, targets.to(device), soft_box=soft_box, soft_cls=soft_cls, soft_object=soft_obj)
+                        if RANK != -1:
+                            loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                        if opt.quad:
+                            loss *= 4.
+                    # Backward
+                    scaler.scale(loss).backward()
+            # # Forward
+            # with amp.autocast(enabled=cuda):
+            #     pred = model(imgs)  # forward
+            #     loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+            #     if RANK != -1:
+            #         loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+            #     if opt.quad:
+            #         loss *= 4.
 
             # Backward
-            scaler.scale(loss).backward()
+            # scaler.scale(loss).backward()
 
             # Optimize
             if ni - last_opt_step >= accumulate:

@@ -98,6 +98,9 @@ class ComputeLoss:
         # Define criteria
         BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device))
         BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['obj_pw']], device=device))
+        DboxLoss = nn.MSELoss(reduction="none")
+        DclsLoss = nn.MSELoss(reduction="none")
+        DobjLoss = nn.MSELoss(reduction="none")
 
         # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
         self.cp, self.cn = smooth_BCE(eps=h.get('label_smoothing', 0.0))  # positive, negative BCE targets
@@ -111,14 +114,18 @@ class ComputeLoss:
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, 0.02])  # P3-P7
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, 1.0, h, autobalance
+        self.DboxLoss, self.DclsLoss, self.DobjLoss = DboxLoss, DclsLoss, DobjLoss
         for k in 'na', 'nc', 'nl', 'anchors':
             setattr(self, k, getattr(det, k))
 
-    def __call__(self, p, targets):  # predictions, targets, model
+    def __call__(self, p, targets, soft_box=None, soft_cls=None, soft_object=None):  # predictions, targets, model
         device = targets.device
         lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
 
+        Teach_BOX = [[],[],[]]
+        Teach_obj = [[], [], []]
+        Teach_cls = [[], [], []]
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
@@ -132,27 +139,50 @@ class ComputeLoss:
                 pxy = ps[:, :2].sigmoid() * 2 - 0.5
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                if not soft_cls:
+                    Teach_BOX[i] = pbox.detach()
+                    Teach_obj[i] = pi.detach()
+                    Teach_cls[i] = ps[:,5:].detach()
 
+                if not soft_box:
+                    iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
+                    lbox += (1.0 - iou).mean()  # iou loss
+                else:
+                    iou_s = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True) # iou(prediction, target)
+                    iou_t = bbox_iou(pbox.T, soft_box[i][i], x1y1x2y2=False, CIoU=True)
+                    t_obj_scale = soft_object[i][..., 4].sigmoid()
+                    b_obj_scale = t_obj_scale.unsqueeze(-1).repeat(1, 1, 1, 1, 4)
+                    # lbox_teach = Teach_obj[i]*((1.0 - giou_t).mean())
+                    lbox += (1.0 - iou_s).mean() + torch.mean(self.DboxLoss(pi[..., :4], soft_object[i][..., :4]) * b_obj_scale)  # iou loss
                 # Objectness
                 score_iou = iou.detach().clamp(0).type(tobj.dtype)
+                score_iou_s = iou_s.detach().clamp(0).type(tobj.dtype)
                 if self.sort_obj_iou:
                     sort_id = torch.argsort(score_iou)
                     b, a, gj, gi, score_iou = b[sort_id], a[sort_id], gj[sort_id], gi[sort_id], score_iou[sort_id]
-                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * score_iou  # iou ratio
 
+                if not soft_box:
+                    tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * score_iou  # iou ratio
+                else:
+                    tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * score_iou_s
+                    
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
                     t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
-
+                    if not soft_cls:
+                        lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+                    else:
+                        c_obj_scale = t_obj_scale.unsqueeze(-1).repeat(1, 1, 1, 1, self.nc)
+                        lcls += torch.mean(self.DclsLoss(pi[..., 5:], soft_object[i][..., 5:]) * c_obj_scale) +  self.BCEcls(ps[:, 5:], t)
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
                 #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
 
-            obji = self.BCEobj(pi[..., 4], tobj)
+            if not soft_object:
+                obji = self.BCEobj(pi[..., 4], tobj)
+            else:
+                obji += self.BCEobj(pi[..., 4], tobj)+torch.mean(self.DobjLoss(pi[..., 4], soft_object[i][..., 4]) * t_obj_scale)
             lobj += obji * self.balance[i]  # obj loss
             if self.autobalance:
                 self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
@@ -164,8 +194,10 @@ class ComputeLoss:
         lcls *= self.hyp['cls']
         bs = tobj.shape[0]  # batch size
 
-        return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
-
+        if soft_object:
+            return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
+        else:
+            return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach(), Teach_BOX, Teach_cls, Teach_obj
     def build_targets(self, p, targets):
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
