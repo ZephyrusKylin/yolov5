@@ -120,7 +120,7 @@ class ComputeLoss:
 
     def __call__(self, p, targets, soft_box=None, soft_cls=None, soft_object=None):  # predictions, targets, model
         device = targets.device
-        lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+        lcls, lbox, lobj, obji = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
 
         Teach_BOX = [[],[],[]]
@@ -148,23 +148,19 @@ class ComputeLoss:
                     iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
                     lbox += (1.0 - iou).mean()  # iou loss
                 else:
-                    iou_s = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True) # iou(prediction, target)
+                    iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True) # iou(prediction, target)
                     iou_t = bbox_iou(pbox.T, soft_box[i][i], x1y1x2y2=False, CIoU=True)
                     t_obj_scale = soft_object[i][..., 4].sigmoid()
                     b_obj_scale = t_obj_scale.unsqueeze(-1).repeat(1, 1, 1, 1, 4)
                     # lbox_teach = Teach_obj[i]*((1.0 - giou_t).mean())
-                    lbox += (1.0 - iou_s).mean() + torch.mean(self.DboxLoss(pi[..., :4], soft_object[i][..., :4]) * b_obj_scale)  # iou loss
+                    lbox += (1.0 - iou).mean() + torch.mean(self.DboxLoss(pi[..., :4], soft_object[i][..., :4]) * b_obj_scale)  # iou loss
                 # Objectness
                 score_iou = iou.detach().clamp(0).type(tobj.dtype)
-                score_iou_s = iou_s.detach().clamp(0).type(tobj.dtype)
                 if self.sort_obj_iou:
                     sort_id = torch.argsort(score_iou)
                     b, a, gj, gi, score_iou = b[sort_id], a[sort_id], gj[sort_id], gi[sort_id], score_iou[sort_id]
 
-                if not soft_box:
-                    tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * score_iou  # iou ratio
-                else:
-                    tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * score_iou_s
+                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * score_iou
                     
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)

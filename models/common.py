@@ -83,12 +83,10 @@ class USConv2d(nn.Conv2d):
         return y
 
 class SwitchableBatchNorm2d(nn.Module):
-    def __init__(self, c, rate=1 ):
+    def __init__(self, c):
         super(SwitchableBatchNorm2d, self).__init__()
-        num_features_list = [make_divisible_sl(c*i/rate)*rate for i in WIDTH_LIST]
-        self.num_features=num_features_list
+        num_features_list = [make_divisible_sl(c*i) for i in WIDTH_LIST]
         self.num_features_list = num_features_list
-        self.num_features = max(num_features_list)
         bns = []
         for i in num_features_list:
             bns.append(nn.BatchNorm2d(i))
@@ -104,21 +102,25 @@ class SwitchableBatchNorm2d(nn.Module):
 
 class Conv(nn.Module):
     # Standard convolution
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, us='normal'):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, us='normal', bias=False):  # ch_in, ch_out, kernel, stride, padding, groups
         super().__init__()
-        self.conv = USConv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False, us=us)
+        self.conv = USConv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=bias, us=us)
         self.bn = SwitchableBatchNorm2d(c2)
         self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.us = us
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        if self.us == 'end':
+            return self.conv(x)
+        else:
+            return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
         return self.act(self.conv(x))
 
 class Conv_in(nn.Module):
     # Standard convolution
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, us='start'):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, us='begin'):  # ch_in, ch_out, kernel, stride, padding, groups
         super().__init__()
         self.conv = USConv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False, us=us)
         self.bn = SwitchableBatchNorm2d(c2)
